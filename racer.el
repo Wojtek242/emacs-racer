@@ -68,6 +68,7 @@
 (require 'thingatpt)
 (require 'button)
 (require 'help-mode)
+(require 'deferred)
 
 (defgroup racer nil
   "Code completion, goto-definition and docs browsing for Rust via racer."
@@ -189,30 +190,54 @@ racer or racer.el."
     (switch-to-buffer buf)
     (goto-char (point-min))))
 
-(defun racer--call (command &rest args)
-  "Call racer command COMMAND with args ARGS.
-Return stdout if COMMAND exits normally, otherwise show an
-error."
+(defun racer--process-shell-ouput (output)
+  "Process OUTPUT from the racer shell call.
+Return stdout if command exited OK, and throw a `user-error'
+otherwise.  The output is expected to be a list of (exit-code
+stdout stderr)"
+  (-let [(exit-code stdout stderr) output]
+    ;; Use `equal' instead of `zero' as exit-code can be a string
+    ;; "Aborted" if racer crashes.
+    (unless (equal 0 exit-code)
+      (user-error "%s exited with %s.  `M-x racer-debug' for more info"
+                  racer-cmd exit-code))
+    stdout))
+
+(defun racer--call (defer command &rest args)
+  "Call (or DEFER) racer command COMMAND with args ARGS.
+Return stdout if COMMAND exits normally, otherwise show an error.
+If DEFER is equal to `defer', return deferred object instead
+which returns stdout or shows an error."
   (let ((rust-src-path (or racer-rust-src-path (getenv "RUST_SRC_PATH")))
         (cargo-home (or racer-cargo-home (getenv "CARGO_HOME"))))
     (when (null rust-src-path)
       (user-error "You need to set `racer-rust-src-path' or `RUST_SRC_PATH'"))
     (unless (file-exists-p rust-src-path)
-      (user-error "No such directory: %s. Please set `racer-rust-src-path' or `RUST_SRC_PATH'"
+      (user-error "No such directory: %s.  Please set `racer-rust-src-path' or `RUST_SRC_PATH'"
                   rust-src-path))
     (let ((default-directory (or (racer--cargo-project-root) default-directory))
           (process-environment (append (list
                                         (format "RUST_SRC_PATH=%s" (expand-file-name rust-src-path))
                                         (format "CARGO_HOME=%s" (expand-file-name cargo-home)))
                                        process-environment)))
-      (-let [(exit-code stdout _stderr)
-             (racer--shell-command racer-cmd (cons command args))]
-        ;; Use `equal' instead of `zero' as exit-code can be a string
-        ;; "Aborted" if racer crashes.
-        (unless (equal 0 exit-code)
-          (user-error "%s exited with %s. `M-x racer-debug' for more info"
-                      racer-cmd exit-code))
-        stdout))))
+      (if (eq 'defer defer)
+          (deferred:nextc
+            (racer--deferred-shell-command racer-cmd (cons command args))
+            'racer--process-shell-ouput)
+        (racer--process-shell-ouput
+         (racer--shell-command racer-cmd (cons command args)))))))
+
+(defmacro racer--with-deferred-temporary-file (path-sym &rest body)
+  "Create a temporary file, and bind its path to PATH-SYM.
+Connect to deferred BODY, then delete the temporary file on
+callback."
+  (declare (indent 1) (debug (symbolp body)))
+  `(let ((,path-sym (make-temp-file "racer")))
+     (deferred:nextc
+       (progn ,@body)
+       (lambda (output)
+         (delete-file ,path-sym)
+         output))))
 
 (defmacro racer--with-temporary-file (path-sym &rest body)
   "Create a temporary file, and bind its path to PATH-SYM.
@@ -229,6 +254,28 @@ Evaluate BODY, then delete the temporary file."
     (insert-file-contents-literally file)
     (buffer-string)))
 
+(defun racer--set-prev-state (racer-cmd args exit-code stdout stderr)
+  "Set the racer--prev-state variable.
+
+This sets the following elements from the input parameters
+`:program' RACER-CMD
+`:args' ARGS
+`:exit-code' EXIT-CODE
+`:stdout' STDOUT
+`:stderr' STDERR.
+
+Additionally it also sets `default-directory' and
+`process-environment'"
+  (setq racer--prev-state
+        (list
+         :program racer-cmd
+         :args args
+         :exit-code exit-code
+         :stdout stdout
+         :stderr stderr
+         :default-directory default-directory
+         :process-environment process-environment)))
+
 (defun racer--shell-command (program args)
   "Execute PROGRAM with ARGS.
 Return a list (exit-code stdout stderr)."
@@ -243,29 +290,43 @@ Return a list (exit-code stdout stderr)."
                      nil args))
         (setq stdout (buffer-string)))
       (setq stderr (racer--slurp tmp-file-for-stderr))
-      (setq racer--prev-state
-            (list
-             :program program
-             :args args
-             :exit-code exit-code
-             :stdout stdout
-             :stderr stderr
-             :default-directory default-directory
-             :process-environment process-environment))
+      (racer--set-prev-state racer-cmd args exit-code stdout stderr)
       (list exit-code stdout stderr))))
 
-(defun racer--call-at-point (command)
+(defun racer--deferred-shell-command (program args)
+  "Execute PROGRAM with ARGS.
+Return a deferred object that returns (exit-code stdout stderr)
+on callback."
+  (deferred:nextc
+    (apply #'deferred:process-ec program args)
+    (lambda (output)
+      ;; deferred combines stdout and stderr
+      (let ((exit-code (nth 0 output))
+            (stdout (nth 1 output))
+            (stderr ""))
+      (racer--set-prev-state racer-cmd args exit-code stdout stderr)
+      (list exit-code stdout stderr)))))
+
+(defun racer--call-at-point (command &optional defer)
   "Call racer command COMMAND at point of current buffer.
-Return a list of all the lines returned by the command."
-  (racer--with-temporary-file tmp-file
-    (write-region nil nil tmp-file nil 'silent)
-    (s-lines
-     (s-trim-right
-      (racer--call command
-                   (number-to-string (line-number-at-pos))
-                   (number-to-string (racer--current-column))
-                   (buffer-file-name (buffer-base-buffer))
-                   tmp-file)))))
+Return a list of all the lines returned by the command.  If DEFER
+is non-nil, run asynchronously and return deferred object that
+returns the list on callback."
+  (let ((line (number-to-string (line-number-at-pos)))
+        (column (number-to-string (racer--current-column)))
+        (filename (buffer-file-name (buffer-base-buffer))))
+    (if defer
+        (racer--with-deferred-temporary-file tmp-file
+          (write-region nil nil tmp-file nil 'silent)
+          (deferred:nextc
+            (racer--call 'defer command line column filename tmp-file)
+            (lambda (output)
+              (s-lines (s-trim-right output)))))
+      (racer--with-temporary-file tmp-file
+        (write-region nil nil tmp-file nil 'silent)
+        (s-lines
+         (s-trim-right
+          (racer--call 'no-defer command line column filename tmp-file)))))))
 
 (defun racer--read-rust-string (string)
   "Convert STRING, a rust string literal, to an elisp string."
@@ -613,9 +674,9 @@ Commands:
         (parent (f-filename (f-parent path))))
     (f-join parent file)))
 
-(defun racer-complete (&optional _ignore)
-  "Completion candidates at point."
-  (->> (racer--call-at-point "complete")
+(defun racer--parse-complete-candidates (candidates)
+  "Parse the completion CANDIDATES returned by racer."
+  (->> candidates
        (--filter (s-starts-with? "MATCH" it))
        (--map (-let [(name line col file matchtype ctx)
                      (s-split-up-to "," (s-chop-prefix "MATCH " it) 5)]
@@ -625,6 +686,17 @@ Commands:
                 (put-text-property 0 1 'matchtype matchtype name)
                 (put-text-property 0 1 'ctx ctx name)
                 name))))
+
+(defun racer-complete-deferred (&optional _ignore)
+  "Completion candidates at point.  Return a deferred object."
+  (deferred:nextc
+    (racer--call-at-point "complete" 'defer)
+    'racer--parse-complete-candidates))
+
+(defun racer-complete (&optional _ignore)
+  "Completion candidates at point."
+  (racer--parse-complete-candidates
+   (racer--call-at-point "complete")))
 
 (defun racer--trim-up-to (needle s)
   "Return content after the occurrence of NEEDLE in S."
@@ -761,6 +833,13 @@ If PATH is not in DIRECTORY, just abbreviate it."
   "Get a prefix from current position."
   (company-grab-symbol-cons "\\.\\|::" 2))
 
+(defun company-racer-candidates (callback)
+  "Return candidates at point for company backend with CALLBACK."
+  (deferred:nextc
+    (racer-complete-deferred)
+    (lambda (candidates)
+        (funcall callback candidates))))
+
 (defun racer-company-backend (command &optional arg &rest ignored)
   "`company-mode' completion back-end for racer.
 Provide completion info according to COMMAND and ARG.  IGNORED, not used."
@@ -770,8 +849,7 @@ Provide completion info according to COMMAND and ARG.  IGNORED, not used."
     (prefix (and (derived-mode-p 'rust-mode)
                  (not (company-in-string-or-comment))
                  (or (racer--get-prefix) 'stop)))
-    (candidates (cons :async (lambda (callback)
-                               (funcall callback (racer-complete)))))
+    (candidates (cons :async 'company-racer-candidates))
     (annotation (racer-complete--annotation arg))
     (location (racer-complete--location arg))
     (meta (racer-complete--docsig arg))
